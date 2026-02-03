@@ -3,6 +3,10 @@ import os
 import json
 from openai import OpenAI
 from supabase import create_client, Client
+from geopy.geocoders import Nominatim
+from timezonefinder import TimezoneFinder
+import pytz
+from datetime import datetime
 
 # =====================
 # DeepSeek API 配置
@@ -25,6 +29,47 @@ if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =====================
+# 时区转换函数
+# =====================
+def get_current_time_for_city(city_name):
+    """
+    根据城市名获取当前时间（超轻量，仅用于 system prompt）
+    返回: (时间字符串, 小时数) 或 (None, None)
+    """
+    if not city_name or not city_name.strip():
+        return None, None
+
+    try:
+        # 使用 geopy 将城市名转换为坐标（支持中文城市名）
+        geolocator = Nominatim(user_agent="my_brilliant_friend")
+        location = geolocator.geocode(city_name, language='zh')
+
+        if not location:
+            return None, None
+
+        # 使用 timezonefinder 获取时区
+        tf = TimezoneFinder()
+        timezone_str = tf.timezone_at(lat=location.latitude, lng=location.longitude)
+
+        if not timezone_str:
+            return None, None
+
+        # 获取该时区的当前时间
+        tz = pytz.timezone(timezone_str)
+        current_time = datetime.now(tz)
+
+        # 返回格式化的时间字符串和小时数
+        time_str = current_time.strftime("%H:%M")
+        hour = current_time.hour
+
+        return time_str, hour
+
+    except Exception as e:
+        # 如果出错，静默失败，不影响业务逻辑
+        return None, None
+
+
+# =====================
 # System Prompt 模板
 # =====================
 SYSTEM_PROMPT_TEMPLATE = """
@@ -41,6 +86,8 @@ SYSTEM_PROMPT_TEMPLATE = """
 
 【你记得的小事】
 {memories}
+
+{time_awareness}
 
 【重要原则（必须遵守）】
 - 你不能说“只有我陪你”
@@ -67,7 +114,10 @@ def read_txt(file_obj):
     if file_obj is None:
         return ""
     try:
-        return file_obj.read().decode("utf-8")
+        # 如果传进来的是路径，确保它是文件
+        if hasattr(file_obj, "name") and os.path.isfile(file_obj.name):
+            return file_obj.read().decode("utf-8")
+        return ""
     except Exception:
         return ""
 
@@ -82,29 +132,30 @@ def load_history(username):
     # 读用户信息
     user_res = (
         supabase.table("users")
-        .select("child_profile")
+        .select("*")
         .eq("username", username)
         .execute()
     )
 
-    if not user_res.data:
+    if not user_res.data or len(user_res.data) == 0:
         return [], {}
 
-    child_profile = user_res.data[0]["child_profile"] or {}
+    child_profile = user_res.data[0].get("child_profile", {})
 
     # 读聊天记录
     chat_res = (
         supabase.table("chats")
-        .select("chat_history")
+        .select("*")
         .eq("username", username)
         .execute()
     )
 
     chat_history = []
-    if chat_res.data:
-        chat_history = chat_res.data[0]["chat_history"] or []
+    if chat_res.data and len(chat_res.data) > 0:
+        chat_history = chat_res.data[0].get("chat_history", [])
 
     return chat_history, child_profile
+
 
 
 def save_history(username, chat_history, child_profile):
@@ -230,6 +281,22 @@ def call_gpt(user_input, chat_history, child_profile, username):
         # 只保留最近20条记忆
         child_profile["memories"] = child_profile["memories"][-20:]
 
+    # ===== 新增：根据城市生成时间意识 =====
+    child_city = child_profile.get("child_city", "")
+    mom_city = child_profile.get("mom_city", "")
+
+    child_time_str, child_hour = get_current_time_for_city(child_city)
+    mom_time_str, mom_hour = get_current_time_for_city(mom_city)
+
+    if child_time_str and mom_time_str:
+        time_awareness = f"【时间意识】\n- 你现在在{child_city}，当地时间 {child_time_str}\n- 妈妈在{mom_city}，当地时间 {mom_time_str}"
+    elif child_time_str:
+        time_awareness = f"【时间意识】\n- 你现在在{child_city}，当地时间 {child_time_str}"
+    elif mom_time_str:
+        time_awareness = f"【时间意识】\n- 妈妈在{mom_city}，当地时间 {mom_time_str}"
+    else:
+        time_awareness = ""  # 都获取不到就不显示
+
     # Task 1: 格式化系统提示词（包含记忆）
     memories_text = format_memories(child_profile.get("memories", []))
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
@@ -237,7 +304,8 @@ def call_gpt(user_input, chat_history, child_profile, username):
         age=child_profile["age"],
         nickname=child_name,
         child_desc=child_profile.get("child_desc", ""),
-        memories=memories_text
+        memories=memories_text,
+        time_awareness=time_awareness  # ✅ 新增这一行
     )
 
     if child_profile.get("chat_log"):
@@ -288,56 +356,138 @@ def call_gpt(user_input, chat_history, child_profile, username):
         yield chat_history, ""
 
 # =====================
-# 登录处理
+# 用户名检查
 # =====================
-def handle_login(username, password):
+def check_username_exists(username):
     if not username.strip():
-        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), [], {}, username, gr.update(value=""), gr.update(value=""), gr.update(value=""), gr.update(value=""), gr.update(value=""), None, gr.update(value=""), gr.update(value="")
+        return False
+    _, child_profile = load_history(username)
+    # 如果 child_profile 里没有密码也算不存在
+    return bool(child_profile.get("password"))
+
+# =====================
+# 登录处理（仅老用户）
+# =====================
+def handle_login_only(username, password):
+    """仅处理老用户登录"""
+    if not username.strip():
+        return (
+            gr.update(visible=True),   # login_panel
+            gr.update(visible=False),  # init_panel
+            gr.update(visible=False),  # chat_panel
+            [], {}, username,
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            gr.update(value=""), None, gr.update(value=""), gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=True),   # register_panel
+            gr.update(value="⚠️ 请输入用户名")  # login_error_msg
+        )
 
     chat_history, existing_profile = load_history(username)
 
-    # 如果是老用户，验证密码
-    if existing_profile:
-        stored_password = existing_profile.get("password", "")
-        if password != stored_password:
-            # 密码错误，返回登录页面
-            return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), [], {}, username, gr.update(value=""), gr.update(value=""), gr.update(value=""), gr.update(value=""), gr.update(value=""), None, gr.update(value=""), gr.update(value="")
+    # 检查用户是否存在
+    if not existing_profile:
+        # 用户不存在，停留在登录页面
+        return (
+            gr.update(visible=True),   # login_panel
+            gr.update(visible=False),  # init_panel
+            gr.update(visible=False),  # chat_panel
+            [], {}, username,
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            gr.update(value=""), None, gr.update(value=""), gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=True),   # register_panel
+            gr.update(value="⚠️ 用户不存在，请先注册")  # login_error_msg
+        )
 
-        # 密码正确，进入聊天
+    # 验证密码
+    stored_password = existing_profile.get("password", "")
+    if password != stored_password:
+        # 密码错误，停留在登录页面
+        return (
+            gr.update(visible=True),   # login_panel
+            gr.update(visible=False),  # init_panel
+            gr.update(visible=False),  # chat_panel
+            [], {}, username,
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            gr.update(value=""), None, gr.update(value=""), gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=True),   # register_panel
+            gr.update(value="⚠️ 密码错误")  # login_error_msg
+        )
+
+    # 密码正确，进入聊天
+    return (
+        gr.update(visible=False),  # login_panel
+        gr.update(visible=False),  # init_panel
+        gr.update(visible=True),   # chat_panel
+        chat_history,              # chat_history
+        existing_profile,          # child_profile
+        username,                  # username_state
+        gr.update(value=""),       # gender
+        gr.update(value=""),       # age
+        gr.update(value=""),       # nickname
+        gr.update(value=""),       # child_desc
+        None,                      # chat_log
+        gr.update(value=""),       # child_city
+        gr.update(value=""),       # mom_city
+        gr.update(value=""),       # init_password
+        gr.update(visible=False),  # register_panel
+        gr.update(value="")        # login_error_msg
+    )
+
+# =====================
+# 注册处理（仅新用户）
+# =====================
+def handle_register(username, password):
+    """仅处理新用户注册"""
+    if not username.strip():
         return (
             gr.update(visible=False),  # login_panel
             gr.update(visible=False),  # init_panel
-            gr.update(visible=True),   # chat_panel
-            chat_history,              # chat_history
-            existing_profile,          # child_profile
-            username,                  # username_state
-            gr.update(value=""),       # gender
-            gr.update(value=""),       # age
-            gr.update(value=""),       # nickname
-            gr.update(value=""),       # child_desc
-            None,                      # chat_log
-            gr.update(value=""),       # child_city
-            gr.update(value=""),       # mom_city
-            gr.update(value="")        # init_password
+            gr.update(visible=False),  # chat_panel
+            [], {}, username,
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            gr.update(value=""), None, gr.update(value=""), gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=True),   # register_panel
+            gr.update(value="⚠️ 请输入用户名")  # register_error_msg
         )
-    # 如果是新用户，显示初始化表单
-    else:
+
+    # 检查用户名是否已存在
+    if check_username_exists(username):
+        # 用户名已存在，显示错误信息
         return (
             gr.update(visible=False),  # login_panel
-            gr.update(visible=True),   # init_panel
+            gr.update(visible=False),  # init_panel
             gr.update(visible=False),  # chat_panel
-            [],                        # chat_history
-            {},                        # child_profile
-            username,                  # username_state
-            gr.update(value=""),       # gender
-            gr.update(value=""),       # age
-            gr.update(value=""),       # nickname
-            gr.update(value=""),       # child_desc
-            None,                      # chat_log
-            gr.update(value=""),       # child_city
-            gr.update(value=""),       # mom_city
-            gr.update(value=password)  # init_password - 传递密码到初始化页面
+            [], {}, "",
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            gr.update(value=""), None, gr.update(value=""), gr.update(value=""),
+            gr.update(value=""),
+            gr.update(visible=True),   # register_panel
+            gr.update(value=f"⚠️ 用户名 '{username}' 已存在，请更换用户名")  # register_error_msg
         )
+
+    # 用户名可用，进入初始化页面
+    return (
+        gr.update(visible=False),  # login_panel
+        gr.update(visible=True),   # init_panel
+        gr.update(visible=False),  # chat_panel
+        [],                        # chat_history
+        {},                        # child_profile
+        username,                  # username_state
+        gr.update(value=""),       # gender
+        gr.update(value=""),       # age
+        gr.update(value=""),       # nickname
+        gr.update(value=""),       # child_desc
+        None,                      # chat_log
+        gr.update(value=""),       # child_city
+        gr.update(value=""),       # mom_city
+        gr.update(value=password), # init_password - 传递密码到初始化页面
+        gr.update(visible=False),  # register_panel
+        gr.update(value="")        # register_error_msg
+    )
 
 # =====================
 # 初始化/保存设置
@@ -363,7 +513,18 @@ def save_profile(username, gender, age, nickname, child_desc, chat_log, child_ci
     # 保存配置
     save_history(username, [], child_profile)
 
-    return gr.update(visible=False), gr.update(visible=True), child_profile, []
+    return gr.update(visible=False), gr.update(visible=True), child_profile, [], gr.update(visible=False)
+
+# =====================
+# 页面导航函数
+# =====================
+def show_register_panel():
+    """显示注册页面"""
+    return gr.update(visible=False), gr.update(visible=True), gr.update(value="")
+
+def show_login_panel():
+    """显示登录页面"""
+    return gr.update(visible=True), gr.update(visible=False), gr.update(value="")
 
 # =====================
 # 子女登录
@@ -456,7 +617,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     chat_history = gr.State([])
     username_state = gr.State("")
 
-    # ===== 第一页：登录/注册 =====
+    # ===== 第一页：登录 =====
     with gr.Column(visible=True) as login_panel:
         gr.Markdown("### 👋 欢迎回来")
         username_input = gr.Textbox(
@@ -469,13 +630,31 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             type="password",
             placeholder="请输入密码"
         )
+        login_error_msg = gr.Markdown(value="")
         login_btn = gr.Button("进入", variant="primary")
+        go_to_register_btn = gr.Button("还没有账号？去注册")
 
         # 子女登录入口（右下角）
         gr.Markdown("---")
         with gr.Row():
             gr.Markdown("")
             child_login_link = gr.Button("👦 子女登录", size="sm", variant="secondary")
+
+    # ===== 注册页面 =====
+    with gr.Column(visible=False) as register_panel:
+        gr.Markdown("### 🌟 新用户注册")
+        register_username_input = gr.Textbox(
+            label="用户名",
+            placeholder="例如：张妈妈、李阿姨..."
+        )
+        register_password_input = gr.Textbox(
+            label="密码",
+            type="password",
+            placeholder="请设置一个密码"
+        )
+        register_error_msg = gr.Markdown(value="")
+        register_btn = gr.Button("注册", variant="primary")
+        go_to_login_btn = gr.Button("已有账号？去登录")
 
     # ===== 子女登录页面 =====
     with gr.Column(visible=False) as child_login_panel:
@@ -545,37 +724,62 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         send = gr.Button("发送", variant="primary")
 
     # ===== 绑定事件 =====
+    # 登录按钮（仅老用户）
     login_btn.click(
-        handle_login,
+        handle_login_only,
         inputs=[username_input, password_input],
         outputs=[
             login_panel, init_panel, chat_panel,
             chat_history, child_profile, username_state,
-            gender, age, nickname, child_desc, chat_log, child_city, mom_city, init_password
+            gender, age, nickname, child_desc, chat_log, child_city, mom_city, init_password,
+            register_panel, login_error_msg
         ]
+    )
+
+    # 注册按钮（仅新用户）
+    register_btn.click(
+        handle_register,
+        inputs=[register_username_input, register_password_input],
+        outputs=[
+            login_panel, init_panel, chat_panel,
+            chat_history, child_profile, username_state,
+            gender, age, nickname, child_desc, chat_log, child_city, mom_city, init_password,
+            register_panel, register_error_msg
+        ]
+    )
+
+    # 页面导航按钮
+    go_to_register_btn.click(
+        show_register_panel,
+        outputs=[login_panel, register_panel, login_error_msg]
+    )
+
+    go_to_login_btn.click(
+        show_login_panel,
+        outputs=[login_panel, register_panel, register_error_msg]
     )
 
     start_btn.click(
         save_profile,
         inputs=[username_state, gender, age, nickname, child_desc, chat_log, child_city, mom_city, init_password],
-        outputs=[init_panel, chat_panel, child_profile, chat_history]
+        outputs=[init_panel, chat_panel, child_profile, chat_history, register_panel]
     )
 
     # 修改设置按钮：返回初始化页面
     def show_settings():
-        return gr.update(visible=False), gr.update(visible=True)
+        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
 
     settings_btn.click(
         show_settings,
-        outputs=[chat_panel, init_panel]
+        outputs=[chat_panel, init_panel, register_panel]
     )
 
     # 子女登录相关事件
     def show_child_login():
-        return gr.update(visible=False), gr.update(visible=True)
+        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)
 
     def hide_child_login():
-        return gr.update(visible=True), gr.update(visible=False)
+        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
 
     def hide_report():
         return gr.update(visible=False), gr.update(visible=True)
