@@ -181,6 +181,11 @@ def save_history(username, chat_history=None, child_profile=None, update_user=Fa
         print("[WARNING] Supabase client not initialized!")
         return
 
+    # ✅ 防止空用户名
+    if not username or not username.strip():
+        print("[ERROR] Cannot save history: username is empty!")
+        return
+
     try:
         # 确保用户在 users 表中存在（避免外键约束错误）
         user_res = supabase.table("users").select("*").eq("username", username).execute()
@@ -294,7 +299,7 @@ def format_memories(memories):
 # =====================
 # 调用 GPT
 # =====================
-def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_city):
+def call_gpt(user_input, chat_history, child_profile, username):
     if not user_input.strip():
         return [], chat_history, ""
 
@@ -304,6 +309,13 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
     nickname = child_profile.get("nickname", "孩子")
     child_desc = child_profile.get("child_desc", "")
     memories = child_profile.get("memories", [])
+
+    # ✅ 从 child_profile 中获取时区信息
+    child_city = child_profile.get("child_city", "UTC+8（北京、上海、香港）")
+    mom_city = child_profile.get("mom_city", "UTC+8（北京、上海、香港）")
+
+    # 调试信息
+    print(f"[DEBUG] call_gpt - username: '{username}', child_city: '{child_city}', mom_city: '{mom_city}'")
 
     # 1️⃣ 先记录用户消息（只做一次）
     chat_history = chat_history + [
@@ -356,14 +368,18 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
     def get_chatbot_messages(chat_history):
         """
         将 chat_history 转成 Chatbot(type="messages") 可识别的格式：
-        [{'role':'user','content':'xxx'}, {'role':'assistant','content':'xxx'}]
+        [{'role':'user','content':'xxx', 'metadata': {...}}, ...]
         """
         messages = []
         for msg in chat_history:
-            messages.append({
+            message = {
                 "role": msg["role"],
                 "content": msg["content"]
-            })
+            }
+            # ✅ 保留 metadata（包含名字信息）
+            if "metadata" in msg:
+                message["metadata"] = msg["metadata"]
+            messages.append(message)
         return messages
 
     try:
@@ -421,7 +437,9 @@ def handle_login(username, password):
             gr.update(visible=True),
             gr.update(visible=False),
             gr.update(visible=False),  # chat_panel
-            [], {}
+            [], {},
+            "",  # username_state
+            []   # chatbot
         )
 
     # 用户不存在
@@ -431,7 +449,9 @@ def handle_login(username, password):
             gr.update(visible=True),
             gr.update(visible=False),
             gr.update(visible=False),
-            [], {}
+            [], {},
+            "",  # username_state
+            []   # chatbot
         )
 
     # 密码错误
@@ -441,7 +461,9 @@ def handle_login(username, password):
             gr.update(visible=True),
             gr.update(visible=False),
             gr.update(visible=False),
-            [], {}
+            [], {},
+            "",  # username_state
+            []   # chatbot
         )
 
     # 确保 child_profile 字段完整（防止 KeyError）
@@ -453,14 +475,28 @@ def handle_login(username, password):
     child_profile.setdefault("child_city", "UTC+8（北京、上海、香港）")
     child_profile.setdefault("mom_city", "UTC+8（北京、上海、香港）")
 
+    # 转换 chat_history 为 chatbot 可识别的格式
+    chatbot_messages = []
+    for msg in chat_history:
+        message = {
+            "role": msg["role"],
+            "content": msg["content"]
+        }
+        # ✅ 保留 metadata（包含名字信息）
+        if "metadata" in msg:
+            message["metadata"] = msg["metadata"]
+        chatbot_messages.append(message)
+
     # 登录成功 → 显示聊天面板
     return (
         gr.update(value=""),                   # 清空错误信息
         gr.update(visible=False),              # login_panel
         gr.update(visible=False),              # register_panel
         gr.update(visible=True),               # ✅ chat_panel
-        chat_history,
-        child_profile
+        chat_history,                          # chat_history State
+        child_profile,                         # child_profile State
+        username,                              # ✅ username_state
+        chatbot_messages                       # ✅ chatbot 显示历史记录
     )
 
 
@@ -787,7 +823,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             register_panel,  # 注册面板
             chat_panel,  # 聊天面板
             chat_history,  # 聊天记录状态
-            child_profile  # 子女信息状态
+            child_profile,  # 子女信息状态
+            username_state,  # ✅ 用户名状态
+            chatbot  # ✅ 聊天窗口显示历史记录
         ]
     )
 
@@ -867,13 +905,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
     send.click(
         call_gpt,
-        inputs=[msg, chat_history, child_profile, username_state, child_city, mom_city],
+        inputs=[msg, chat_history, child_profile, username_state],
         outputs=[chatbot, chat_history, msg]
     )
 
     msg.submit(
         call_gpt,
-        inputs=[msg, chat_history, child_profile, username_state, child_city, mom_city],
+        inputs=[msg, chat_history, child_profile, username_state],
         outputs=[chatbot, chat_history, msg]
     )
 
