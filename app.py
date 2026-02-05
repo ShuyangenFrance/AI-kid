@@ -171,27 +171,59 @@ def load_history(username):
     return chat_history, child_profile
 
 
-
-def save_history(username, chat_history, child_profile):
+def save_history(username, chat_history=None, child_profile=None, update_user=False):
+    """
+    保存用户信息和聊天记录到 Supabase
+    - update_user=False 时，只更新 chats 表，不更新 users 表
+    - update_user=True 时，才更新 users 表（用于注册或手动修改）
+    """
     if not supabase:
+        print("[WARNING] Supabase client not initialized!")
         return
 
-    # upsert 用户信息
-    supabase.table("users").upsert(
-        {
-            "username": username,
-            "password": child_profile.get("password", ""),
-            "child_profile": child_profile
-        }
-    ).execute()
+    try:
+        # 确保用户在 users 表中存在（避免外键约束错误）
+        user_res = supabase.table("users").select("*").eq("username", username).execute()
 
-    # upsert 聊天记录
-    supabase.table("chats").upsert(
-        {
-            "username": username,
-            "chat_history": chat_history
-        }
-    ).execute()
+        if not user_res.data or len(user_res.data) == 0:
+            # 用户不存在，创建一个基本的用户记录
+            print(f"[INFO] User {username} not found in users table, creating...")
+            supabase.table("users").insert({
+                "username": username,
+                "password": "",  # 空密码，后续会更新
+                "child_profile": {}
+            }).execute()
+
+        # 保存聊天记录
+        if chat_history is not None:
+            res_chat = supabase.table("chats").upsert(
+                {
+                    "username": username,
+                    "chat_history": chat_history
+                },
+                on_conflict="username"
+            ).execute()
+            print(f"[INFO] Chat save result: {res_chat.data}")
+
+        # 保存用户信息
+        if child_profile is not None and update_user:
+            # 取原密码，防止覆盖空
+            old_user = supabase.table("users").select("*").eq("username", username).execute()
+            password = child_profile.get("password") or (old_user.data[0]["password"] if old_user.data else "")
+
+            res_user = supabase.table("users").upsert(
+                {
+                    "username": username,
+                    "password": password,
+                    "child_profile": child_profile
+                },
+                on_conflict="username"
+            ).execute()
+            print(f"[INFO] User save result: {res_user.data}")
+
+    except Exception as e:
+        print(f"[ERROR] Exception when saving history: {e}")
+
 
 # =====================
 # 辅助函数
@@ -341,23 +373,21 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
             stream=True
         )
 
+        # 流式生成
         for chunk in stream:
             delta = chunk.choices[0].delta.content
             if delta:
                 reply += delta
                 chat_history[-1]["content"] = reply
-                # ✅ 这里输出给 Chatbot 显示
                 yield get_chatbot_messages(chat_history), chat_history, ""
 
-        # 保存完整聊天记录
-        save_history(username, chat_history, child_profile)
+        # 流式完成后再保存一次
+        save_history(username, chat_history, child_profile, update_user=False)
 
     except Exception as e:
         chat_history[-1]["content"] = f"出了一点问题：{str(e)}"
+        save_history(username, chat_history, child_profile)
         yield get_chatbot_messages(chat_history), chat_history, ""
-
-
-
 
 
 def is_profile_ready(profile: dict):
@@ -453,7 +483,10 @@ def handle_register(username, password):
         )
 
     # 用户名可用 → 创建用户，保存密码
-    save_history(username, [], {"password": password})
+    # 注册保存
+    save_history(username, chat_history=[], child_profile={"password": password}, update_user=True)
+
+    username_state.value = username
 
     # 成功 → 直接进入初始化页
     return (
@@ -472,6 +505,9 @@ def save_profile(username, gender, age, nickname, child_desc, chat_log, child_ci
         return gr.update(visible=True), gr.update(visible=False), {}, []
 
     chat_log_text = read_txt(chat_log) if chat_log else ""
+    # 先读取原来的用户信息，保留密码
+    _, existing_profile = load_history(username)
+    password = existing_profile.get("password") if existing_profile else None
 
     child_profile = {
         "gender": gender,
@@ -483,9 +519,14 @@ def save_profile(username, gender, age, nickname, child_desc, chat_log, child_ci
         "mom_city": normalize_timezone_label(mom_city or "UTC+8（北京、上海、香港）"),
         "memories": []
     }
+    if password:
+        child_profile["password"] = password
 
-    # 保存配置
-    save_history(username, [], child_profile)
+    if not username:
+        print("[WARNING] username 为空，初始化阶段不保存到数据库！")
+    else:
+        # 更新用户信息，保留原密码，不会创建新条目
+        save_history(username, [], child_profile, update_user=True)
 
     return gr.update(visible=False), gr.update(visible=True), child_profile, [], gr.update(visible=False)
 
@@ -500,6 +541,20 @@ def show_login_panel():
     """显示登录页面"""
     return gr.update(visible=True), gr.update(visible=False), gr.update(value="")
 
+def handle_logout():
+    """退出登录，返回登录页面，清空所有状态"""
+    return (
+        gr.update(visible=True),   # login_panel 显示
+        gr.update(visible=False),  # chat_panel 隐藏
+        gr.update(visible=False),  # init_panel 隐藏
+        [],                        # 清空 chat_history
+        {},                        # 清空 child_profile
+        gr.update(value=""),       # 清空 username_state
+        gr.update(value=""),       # 清空 username_input
+        gr.update(value=""),       # 清空 password_input
+        []                         # 清空 chatbot
+    )
+
 # =====================
 # 子女登录
 # =====================
@@ -508,15 +563,17 @@ def child_login(parent_name):
         yield gr.update(visible=True), gr.update(visible=False), "请输入妈妈的名字"
         return
 
+    # 重新从 Supabase 读取最新聊天记录
     chat_history, existing_profile = load_history(parent_name)
 
     if not existing_profile:
         yield gr.update(visible=True), gr.update(visible=False), f"没有找到 {parent_name} 的记录"
         return
 
-    # 生成周报（流式输出）
+    # 生成周报
     for report_update in generate_weekly_report(chat_history, existing_profile):
         yield gr.update(visible=False), gr.update(visible=True), report_update
+
 def format_chat_history_for_gr(chat_history):
     """
     将 [{'role': 'user', 'content': ...}, {'role': 'assistant', 'content': ...}]
@@ -706,7 +763,9 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     with gr.Column(visible=False) as chat_panel:
         with gr.Row():
             gr.Markdown("### 💬 聊天")
-            settings_btn = gr.Button("⚙️ 修改设置", size="sm")
+            with gr.Row():
+                settings_btn = gr.Button("⚙️ 修改设置", size="sm")
+                logout_btn = gr.Button("🚪 退出登录", size="sm", variant="secondary")
 
         chatbot = gr.Chatbot(
             value=[],
@@ -788,6 +847,22 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     back_to_child_login_btn.click(
         hide_report,
         outputs=[report_panel, child_login_panel]
+    )
+
+    # 退出登录按钮
+    logout_btn.click(
+        handle_logout,
+        outputs=[
+            login_panel,
+            chat_panel,
+            init_panel,
+            chat_history,
+            child_profile,
+            username_state,
+            username_input,
+            password_input,
+            chatbot
+        ]
     )
 
     send.click(
