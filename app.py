@@ -264,9 +264,14 @@ def format_memories(memories):
 # =====================
 def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_city):
     if not user_input.strip():
-        return chat_history, ""
+        return [], chat_history, ""
 
-    child_name = child_profile.get("nickname", "孩子")
+    # 保险获取子女信息，防止 KeyError
+    gender = child_profile.get("gender", "女")
+    age = child_profile.get("age", "学生")
+    nickname = child_profile.get("nickname", "孩子")
+    child_desc = child_profile.get("child_desc", "")
+    memories = child_profile.get("memories", [])
 
     # 1️⃣ 先记录用户消息（只做一次）
     chat_history = chat_history + [
@@ -277,10 +282,10 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
     if is_goodnight(user_input):
         reply = "好的妈，早点休息，晚安💤"
         chat_history = chat_history + [
-            {"role": "assistant", "content": reply, "metadata": {"title": child_name}}
+            {"role": "assistant", "content": reply, "metadata": {"title": nickname}}
         ]
         save_history(username, chat_history, child_profile)
-        return chat_history, ""
+        return [{"role": "user", "content": user_input}, {"role": "assistant", "content": reply}], chat_history, ""
 
     # 3️⃣ 时区处理
     child_tz = TIMEZONE_MAP.get(child_city, "Asia/Shanghai")
@@ -297,11 +302,11 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
 
     # 4️⃣ 系统提示词
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        gender=child_profile["gender"],
-        age=child_profile["age"],
-        nickname=child_name,
-        child_desc=child_profile.get("child_desc", ""),
-        memories=format_memories(child_profile.get("memories", [])),
+        gender=gender,
+        age=age,
+        nickname=nickname,
+        child_desc=child_desc,
+        memories=format_memories(memories),
         time_awareness=time_awareness
     )
 
@@ -313,8 +318,21 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
     # 6️⃣ 流式输出（只 append assistant）
     reply = ""
     chat_history.append(
-        {"role": "assistant", "content": "", "metadata": {"title": child_name}}
+        {"role": "assistant", "content": "", "metadata": {"title": nickname}}
     )
+
+    def get_chatbot_messages(chat_history):
+        """
+        将 chat_history 转成 Chatbot(type="messages") 可识别的格式：
+        [{'role':'user','content':'xxx'}, {'role':'assistant','content':'xxx'}]
+        """
+        messages = []
+        for msg in chat_history:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        return messages
 
     try:
         stream = client.chat.completions.create(
@@ -328,14 +346,17 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
             if delta:
                 reply += delta
                 chat_history[-1]["content"] = reply
-                yield chat_history, chat_history, ""
+                # ✅ 这里输出给 Chatbot 显示
+                yield get_chatbot_messages(chat_history), chat_history, ""
 
-
+        # 保存完整聊天记录
         save_history(username, chat_history, child_profile)
 
     except Exception as e:
         chat_history[-1]["content"] = f"出了一点问题：{str(e)}"
-        yield chat_history, chat_history, ""
+        yield get_chatbot_messages(chat_history), chat_history, ""
+
+
 
 
 
@@ -366,11 +387,11 @@ def handle_login(username, password):
     # 用户名为空
     if not username.strip():
         return (
-            gr.update(value="⚠️ 请输入用户名"),  # login_error_msg
-            gr.update(visible=True),            # login_panel
-            gr.update(visible=False),           # register_panel
-            [],                                 # chat_history
-            {}                                  # child_profile
+            gr.update(value="⚠️ 请输入用户名"),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),  # chat_panel
+            [], {}
         )
 
     # 用户不存在
@@ -378,6 +399,7 @@ def handle_login(username, password):
         return (
             gr.update(value="⚠️ 用户不存在，请先注册"),
             gr.update(visible=True),
+            gr.update(visible=False),
             gr.update(visible=False),
             [], {}
         )
@@ -388,21 +410,30 @@ def handle_login(username, password):
             gr.update(value="⚠️ 密码错误"),
             gr.update(visible=True),
             gr.update(visible=False),
+            gr.update(visible=False),
             [], {}
         )
 
-    # 登录成功
+    # 确保 child_profile 字段完整（防止 KeyError）
+    child_profile.setdefault("gender", "女")
+    child_profile.setdefault("age", "学生")
+    child_profile.setdefault("nickname", "孩子")
+    child_profile.setdefault("child_desc", "")
+    child_profile.setdefault("memories", [])
+    child_profile.setdefault("child_city", "UTC+8（北京、上海、香港）")
+    child_profile.setdefault("mom_city", "UTC+8（北京、上海、香港）")
+
+    # 登录成功 → 显示聊天面板
     return (
         gr.update(value=""),                   # 清空错误信息
         gr.update(visible=False),              # login_panel
         gr.update(visible=False),              # register_panel
-        chat_history,                          # chat_history state
-        child_profile                           # child_profile state
+        gr.update(visible=True),               # ✅ chat_panel
+        chat_history,
+        child_profile
     )
 
 
-# 注册处理
-# 注册处理
 # 注册处理
 def handle_register(username, password):
     if not username.strip():
@@ -486,6 +517,26 @@ def child_login(parent_name):
     # 生成周报（流式输出）
     for report_update in generate_weekly_report(chat_history, existing_profile):
         yield gr.update(visible=False), gr.update(visible=True), report_update
+def format_chat_history_for_gr(chat_history):
+    """
+    将 [{'role': 'user', 'content': ...}, {'role': 'assistant', 'content': ...}]
+    转换为 [('用户消息', '助手消息')] 的形式
+    """
+    formatted = []
+    user_msg = None
+    for msg in chat_history:
+        if msg["role"] == "user":
+            user_msg = msg["content"]
+        elif msg["role"] == "assistant":
+            assistant_msg = msg["content"]
+            if user_msg is None:
+                user_msg = ""  # 防止出现连续 assistant
+            formatted.append((user_msg, assistant_msg))
+            user_msg = None
+    # 如果最后一条是 user 但没有 assistant 回复，也显示空
+    if user_msg:
+        formatted.append((user_msg, ""))
+    return formatted
 
 # =====================
 # 生成周报
@@ -671,7 +722,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     login_btn.click(
         handle_login,
         inputs=[username_input, password_input],
-        outputs=[login_error_msg, login_panel, register_panel, chat_history, child_profile]
+        outputs=[
+            login_error_msg,  # 错误信息
+            login_panel,  # 登录面板
+            register_panel,  # 注册面板
+            chat_panel,  # 聊天面板
+            chat_history,  # 聊天记录状态
+            child_profile  # 子女信息状态
+        ]
     )
 
     # 去注册按钮
@@ -735,13 +793,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     send.click(
         call_gpt,
         inputs=[msg, chat_history, child_profile, username_state, child_city, mom_city],
-        outputs=[chatbot, msg]
+        outputs=[chatbot, chat_history, msg]
     )
 
     msg.submit(
         call_gpt,
         inputs=[msg, chat_history, child_profile, username_state, child_city, mom_city],
-        outputs=[chatbot, msg]
+        outputs=[chatbot, chat_history, msg]
     )
 
 demo.launch(server_name="0.0.0.0", server_port=7860)
