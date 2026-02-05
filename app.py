@@ -328,13 +328,15 @@ def call_gpt(user_input, chat_history, child_profile, username, child_city, mom_
             if delta:
                 reply += delta
                 chat_history[-1]["content"] = reply
-                yield chat_history, ""
+                yield chat_history, chat_history, ""
+
 
         save_history(username, chat_history, child_profile)
 
     except Exception as e:
         chat_history[-1]["content"] = f"出了一点问题：{str(e)}"
-        yield chat_history, ""
+        yield chat_history, chat_history, ""
+
 
 
 def is_profile_ready(profile: dict):
@@ -656,10 +658,10 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             settings_btn = gr.Button("⚙️ 修改设置", size="sm")
 
         chatbot = gr.Chatbot(
+            value=[],
             height=500,
             type="messages",
-            show_copy_button=True,
-            avatar_images=(None, None)
+            show_copy_button=True
         )
         msg = gr.Textbox(placeholder="你可以慢慢说，我在听", show_label=False)
         send = gr.Button("发送", variant="primary")
@@ -741,4 +743,5 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         inputs=[msg, chat_history, child_profile, username_state, child_city, mom_city],
         outputs=[chatbot, msg]
     )
+
 demo.launch(server_name="0.0.0.0", server_port=7860)
